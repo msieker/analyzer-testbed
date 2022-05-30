@@ -5,6 +5,10 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 
 namespace TestHarness;
+
+/*
+ * This seems to be the "correct" way of declaring diagnostic messages that can be emitted by analyzers.
+ */
 public static class AnalyzerDescriptors
 {
     public static readonly DiagnosticDescriptor FakerMustConfigureAllEntityProperties = new(
@@ -26,7 +30,7 @@ public static class AnalyzerDescriptors
     );
 
     public static readonly DiagnosticDescriptor ExporterMustHaveConstructorTakingEntity = new(
-        "CAT002",
+        "CAT003",
         "Exporter have a constructor that takes an entity",
         "The exporter {0} is missing a public constructor which takes a {1} instance",
         "CodeAnalysisTest",
@@ -35,22 +39,65 @@ public static class AnalyzerDescriptors
     );
 }
 
+/*
+ * Some helper methods that have been used in more than one place
+ */
+public static class Helpers
+{
+    /*
+     * Gets all public properties on a type.
+     */
+    public static IEnumerable<IPropertySymbol> GetTypeProperties(this ITypeSymbol type) =>
+        type.GetMembers().Where(static m => m.DeclaredAccessibility == Accessibility.Public && m.Kind == SymbolKind.Property)
+            .OfType<IPropertySymbol>();
+
+
+    /*
+     * Gets all read-write properties on a type.
+     */
+    public static IEnumerable<IPropertySymbol> GetReadOnlyTypeProperties(this ITypeSymbol type)
+        => GetTypeProperties(type).Where(static p => p.IsReadOnly == false);
+
+    /*
+     * Gets all public constructors on a type that have at least one parameter of a specified type.
+     */
+    public static IEnumerable<IMethodSymbol> GetConstructorsWithAParameterOfType(this INamedTypeSymbol classDecl, ITypeSymbol parameterType) =>
+        classDecl.Constructors.Where(c => c.DeclaredAccessibility == Accessibility.Public && c.Parameters.Any(p => SymbolEqualityComparer.Default.Equals(p.Type, parameterType)));
+}
+
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public class FakerAnalyzer : DiagnosticAnalyzer
 {
+    /*
+     * This is declared on DiagnosticAnalyzer. This contains a list of all possible
+     * messages this analyzer can return.
+     */
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get; } =
         ImmutableArray.Create(AnalyzerDescriptors.FakerMustConfigureAllEntityProperties);
 
     public override void Initialize(AnalysisContext context)
     {
         context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.Analyze);
+
+        /*
+         * Comment this out if you're wanting to debug an analyzer. With this on,
+         * the compiler will make multiple concurrent calls to the actions registered below.
+         * However, for actual use, it should be here, there's even an analyzer that will complain
+         * if this line isn't present.
+         */
         context.EnableConcurrentExecution();
-        context.RegisterSyntaxNodeAction(AnalyzeConstructors, SyntaxKind.ConstructorDeclaration);
+
+        /*
+         * Registers callbacks from the compiler when it hits a class declaration when doing
+         * semantic analysis. Since this analyzer needs both the parse tree and the semantic model
+         * of the compiled code, this is the best place to hook in.
+         */
+        context.RegisterSyntaxNodeAction(AnalyzeClassDeclarations, SyntaxKind.ClassDeclaration);
     }
 
-    private static void AnalyzeConstructors(SyntaxNodeAnalysisContext context)
+    private static void AnalyzeClassDeclarations(SyntaxNodeAnalysisContext context)
     {
-        var containingClass = context.ContainingSymbol?.ContainingType; // Grab the class containing this constructor
+        var containingClass = context.ContainingSymbol as INamedTypeSymbol;
 
         if (containingClass?.BaseType == null) return;  // If the class doesn't inherit from anything, its of no interest
 
@@ -61,15 +108,15 @@ public class FakerAnalyzer : DiagnosticAnalyzer
          * The SymbolEqualityComparer is needed to compare bits of the compiler model (and is a warning to do it any other way)
          * The ConstructedFrom bit is because BaseType itself is the closed generic type, and not the open one we're looking for.
          */
-
         if (!SymbolEqualityComparer.Default.Equals(containingClass.BaseType.ConstructedFrom, faker)) return;
 
+        /*
+         * Pull out the type argument from the base class. Since we're explicitly looking for a class with a
+         * generic base class, this type argument should be there if we got this far.
+         */
         var baseEntity = containingClass.BaseType.TypeArguments[0];
 
-        foreach(var d in AnalyzeFakerInit((context.Node as ConstructorDeclarationSyntax)!, context.SemanticModel, (context.ContainingSymbol as IMethodSymbol)!, baseEntity))
-        {
-            context.ReportDiagnostic(d);
-        }
+        AnalyzeFaker(context, containingClass, baseEntity);
     }
 
     private static IEnumerable<IPropertySymbol> GetRuleForProperties(SemanticModel model, IMethodSymbol ctor)
@@ -87,10 +134,10 @@ public class FakerAnalyzer : DiagnosticAnalyzer
          */
         var node = ctorLocation?.SourceTree?.GetRoot().FindNode(ctorLocation.SourceSpan);
         var ruleForStatements = from n in node?.DescendantNodes().OfType<InvocationExpressionSyntax>()
-            let id = n.Expression as IdentifierNameSyntax
-            where id != null
-            where id.Identifier.ValueText == "RuleFor"
-            select n;
+                                let id = n.Expression as IdentifierNameSyntax
+                                where id != null
+                                where id.Identifier.ValueText == "RuleFor"
+                                select n;
 
         /*
          * Once we have a list of RuleFor statements in the constructor, pluck the first MemberAccessExpression
@@ -106,29 +153,36 @@ public class FakerAnalyzer : DiagnosticAnalyzer
         }
     }
 
-    /*
-     * Nothing involving the parse tree here (Which might not even exist if the entity is in another assembly).
-     * We just ask the compiler for the public properties on the type. Read only properties are ignored since
-     * Bogus doesn't need to touch them.
-     */
-    private static IEnumerable<IPropertySymbol> GetEntityProperties(ITypeSymbol entity)=>
-        entity.GetMembers().Where(m => m.DeclaredAccessibility == Accessibility.Public && m.Kind == SymbolKind.Property)
-            .OfType<IPropertySymbol>()
-            .Where(p=>p.IsReadOnly == false);
-
-    private static IEnumerable<Diagnostic> AnalyzeFakerInit(ConstructorDeclarationSyntax ctorSyntax, SemanticModel model, IMethodSymbol ctor, ITypeSymbol entity)
+    private static void AnalyzeFaker(SyntaxNodeAnalysisContext context, INamedTypeSymbol fakerClass, ITypeSymbol entity)
     {
-        var ruleForProperties = GetRuleForProperties(model, ctor).ToList();
-        var entityProperties = GetEntityProperties(entity).ToList();
-
-        var unassigned = entityProperties.Where(ep => !ruleForProperties.Any(rf => SymbolEqualityComparer.Default.Equals(ep, rf)));
-        foreach (var up in unassigned)
+        // The faker class might have multiple constructors (unlikely), check each one
+        foreach (var ctor in fakerClass.Constructors)
         {
-            yield return Diagnostic.Create(
-                AnalyzerDescriptors.FakerMustConfigureAllEntityProperties,
-                ctorSyntax.Identifier.GetLocation(),
-                entity.Name, up.Name
+            // Get all of the entity properties referenced by RuleFor statements
+            var ruleForProperties = GetRuleForProperties(context.SemanticModel, ctor).ToList();
+            // Get all of the read only public properties on the entity
+            var entityProperties = entity.GetReadOnlyTypeProperties().ToList();
+
+            /*
+             * Do a simple check that all of the entity properties have RuleFor statements
+             * Probably better to do something a bit smarter than a O(n*m) check, but its simple to read.
+             * And n and m will probably never be bigger than a few tens.
+             */
+            var unassigned = entityProperties.Where(ep => !ruleForProperties.Any(rf => SymbolEqualityComparer.Default.Equals(ep, rf)));
+            foreach (var up in unassigned)
+            {
+                // Figure out where the ctor is so we can point the warning at it.
+                var ctorLocation = ctor.Locations.First();
+
+                // Emit the warning
+                context.ReportDiagnostic(
+                    Diagnostic.Create(
+                        AnalyzerDescriptors.FakerMustConfigureAllEntityProperties,
+                        ctorLocation,
+                        entity.Name, up.Name
+                    )
                 );
+            }
         }
     }
 }
@@ -153,28 +207,36 @@ public class ExporterAnalyzer : DiagnosticAnalyzer
     {
         var typeSymbol = context.ContainingSymbol as INamedTypeSymbol;
         if (typeSymbol?.BaseType == null || typeSymbol.IsAbstract) return;
+
+        /*
+         * This is kind of hackish, and I need to figure out the best way of grabbing a reference
+         * to the type we're looking for when used in a non-testing setup. If the exporter classes
+         * are in a separate assembly in a nuget, then it'll have a stable name.
+         */
         var exporter = context.Compilation.GetTypeByMetadataName("CodeAnalysisTest.Exporter`1");
         if (!SymbolEqualityComparer.Default.Equals(typeSymbol.BaseType.ConstructedFrom, exporter)) return;
         Console.WriteLine("Exporter: " + typeSymbol.Name);
 
         var baseEntity = typeSymbol.BaseType.TypeArguments[0];
 
-        CompareExporterAndEntity(context.SemanticModel, typeSymbol, baseEntity);
+        CompareExporterAndEntity(context, typeSymbol, baseEntity);
     }
 
-    private static IEnumerable<IPropertySymbol> GetEntityProperties(ITypeSymbol entity)
+    private static void CompareExporterAndEntity(SyntaxNodeAnalysisContext context, INamedTypeSymbol exporter, ITypeSymbol entity)
     {
-        return entity.GetMembers().Where(m => m.DeclaredAccessibility == Accessibility.Public && m.Kind == SymbolKind.Property)
-            .OfType<IPropertySymbol>()
-            .Where(p => p.IsReadOnly == false);
-    }
+        var constructors = exporter.GetConstructorsWithAParameterOfType(entity).ToList();
 
-    private static IEnumerable<IMethodSymbol> GetConstructorsWithEntity(INamedTypeSymbol exporter, ITypeSymbol entity)
-        => exporter.Constructors.Where(c => c.DeclaredAccessibility == Accessibility.Public && c.Parameters.Any(p => SymbolEqualityComparer.Default.Equals(p.Type, entity)));
-
-    private static void CompareExporterAndEntity(SemanticModel model, INamedTypeSymbol exporter, ITypeSymbol entity)
-    {
-        var constructors = GetConstructorsWithEntity(exporter, entity);
-
+        if (!constructors.Any())
+        {
+            /*
+             * Part of the exporter contract is that exporters have a public constructor that
+             * take the entity to export as a parameter. Throw an error if there isn't one.
+             */
+            context.ReportDiagnostic(
+                Diagnostic.Create(
+                    AnalyzerDescriptors.ExporterMustHaveConstructorTakingEntity,
+                    exporter.Locations.First(l => l.IsInSource),
+                    exporter.Name, entity.Name));
+        }
     }
 }

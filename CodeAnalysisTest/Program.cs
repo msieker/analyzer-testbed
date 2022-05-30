@@ -42,9 +42,9 @@ public class RelatedEntity
 
 public sealed class TestEntityFaker : Faker<TestEntity>
 {
-    public TestEntityFaker(bool useIds = false)
+    public TestEntityFaker(int seed = 42, bool useIds = false)
     {
-        UseSeed(42);
+        UseSeed(seed);
         RuleFor(e => e.Id, (f)=> useIds ? f.IndexFaker : 0);
         RuleFor(e => e.Name, f => f.Commerce.ProductName());
         RuleFor(e => e.Children, (f, e) => (new ChildEntityFaker(e, f.Random.Int(), useIds)).Generate(f.Random.Int(0, 5)));
@@ -54,7 +54,7 @@ public sealed class TestEntityFaker : Faker<TestEntity>
 
 public sealed class ChildEntityFaker : Faker<ChildEntity>
 {
-    public ChildEntityFaker(TestEntity parent, int seed, bool useIds=false)
+    public ChildEntityFaker(TestEntity parent, int seed=1337, bool useIds=false)
     {
         UseSeed(seed);
         
@@ -70,7 +70,7 @@ public sealed class ChildEntityFaker : Faker<ChildEntity>
 
 public sealed class RelatedEntityFaker : Faker<RelatedEntity>
 {
-    public RelatedEntityFaker(int seed, bool useIds = false)
+    public RelatedEntityFaker(int seed=0xbad1dea, bool useIds = false)
     {
         UseSeed(seed);
         RuleFor(e => e.Id, (f) => useIds ? f.IndexFaker : 0);
@@ -97,6 +97,11 @@ public class TestEntityExport : Exporter<TestEntity>
     {
         
     }
+}
+
+public class ChildEntityExporter : Exporter<ChildEntity>
+{
+
 }
 
 public class TestEntityAutoExporter : AutoExporter<TestEntity>
