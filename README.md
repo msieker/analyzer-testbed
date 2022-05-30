@@ -26,7 +26,7 @@ Since this project is spun off of trying to make exporters for an app not as vul
 
 There's two "marker" classes for exporters in this project, a basic `Exporter<TEntity>` and an `AutoExporter<TEntity>`. The basic `Exporter` will just have the basic analyzer checks attached to make sure all properties from the base entity are mapped or explicitly ignored. The `AutoExporter` is meant to use source generators to automate most of the exporter code.
 
-These might be better served as generic attributes once they're out of preview ([What's new in C# 11](https://docs.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-11#generic-attributes).
+These might be better served as generic attributes once they're out of preview ([What's new in C# 11](https://docs.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-11#generic-attributes)).
 
 The general plan for exporters is they take their associated entity type as a constructor parameter, and do all of the mapping in that constructor. Child entities are transformed in the constructor by something like `entity.Children.Select(c=>new ChildExporter(c)).ToList()`. This will make some additional work for things like an Excel exporter, as it will have to reach into the entities and pull out the children. Although it would have to do this at some point regardless it seems, before or after the transform to the exported entity (query the db with Include statements, and then SelectMany from there, or even separate queries per table.). That's one part of the export process I can't think up a good way to have an automated check for. But adding new children entities is something that will happen much less often than adding fields to an existing entity.
 
