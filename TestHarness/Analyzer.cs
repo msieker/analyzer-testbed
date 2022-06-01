@@ -102,6 +102,8 @@ public class FakerAnalyzer : DiagnosticAnalyzer
         if (containingClass?.BaseType == null) return;  // If the class doesn't inherit from anything, its of no interest
 
         var faker = context.Compilation.GetTypeByMetadataName("Bogus.Faker`1");     // Grab the Faker<T> open generic interface
+        
+        if(faker == null) return; // Can't find the faker class. Must not be in this project.
 
         /*
          * Checks that the class being inspected inherits from Faker<T>.
@@ -187,6 +189,8 @@ public class FakerAnalyzer : DiagnosticAnalyzer
     }
 }
 
+internal record AssignmentInfo(ISymbol Left, ISymbol Right);
+
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public class ExporterAnalyzer : DiagnosticAnalyzer
 {
@@ -222,6 +226,70 @@ public class ExporterAnalyzer : DiagnosticAnalyzer
         CompareExporterAndEntity(context, typeSymbol, baseEntity);
     }
 
+    private static IEnumerable<AssignmentInfo> GetEntityAssignmentsInMethod(SyntaxNodeAnalysisContext context, IMethodSymbol method, ITypeSymbol entity)
+    {
+        var entityProps = entity.GetTypeProperties().ToList();
+
+        // Might be looking at a partial method, this gets all places a method is defined.
+        foreach (var rootSyntax in method.DeclaringSyntaxReferences)
+        {
+            // Look for assignments in the method. 
+            var assignments = rootSyntax.GetSyntax().DescendantNodes().OfType<AssignmentExpressionSyntax>();
+            foreach (var a in assignments)
+            {
+                var left = context.SemanticModel.GetSymbolInfo(a.Left).Symbol;
+
+                /*
+                 * This looks through the right side of the assignment for any member accesses. As an example, something like
+                 * m.Property.ToString() would have syntax for both the full expression, and the m.Property. To filter out
+                 * nested expressions like that, look for those expressions that just reference properties on the entity.
+                 *
+                 * TODO: This will have to change when dealing with flattening
+                 */
+                var accesses = from mae in a.Right.DescendantNodesAndSelf().OfType<MemberAccessExpressionSyntax>()
+                               let symbol = context.SemanticModel.GetSymbolInfo(mae).Symbol
+                               where symbol != null && entityProps.Any(ep => SymbolEqualityComparer.Default.Equals(ep, symbol))
+                               select symbol;
+
+                /*
+                 * It's possible for there to be multiple property accesses on the RHS. Something like $"{m.Prop1}: {m.Prop2}".
+                 * For the sake of this analyzer, we'll count all of them.
+                 */
+                foreach (var r in accesses)
+                {
+                    if (r == null)
+                    {
+                        Console.WriteLine($"Unknown syntax: {a.Right.Dump(new DumpOptions { MaxLevel = 1 })}");
+                        continue;
+                    }
+                    yield return new AssignmentInfo(left!, r);
+                }
+            }
+        }
+    }
+
+    public static IEnumerable<ISymbol> FindIgnoredFieldsInMethod(SyntaxNodeAnalysisContext context, IMethodSymbol method, ITypeSymbol entity)
+    {
+        /*
+         * This is basically a retread of the RuleFor() analyzer, except looking for Ignore() calls instead.
+         */
+        foreach (var rootSyntax in method.DeclaringSyntaxReferences)
+        {
+            var ignoreStatements = from n in rootSyntax.GetSyntax().DescendantNodes().OfType<InvocationExpressionSyntax>()
+                let id = n.Expression as IdentifierNameSyntax
+                where id != null
+                where id.Identifier.ValueText == "Ignore"
+                select n;
+            
+            foreach (var s in ignoreStatements)
+            {
+                var entityMember = s.DescendantNodes().OfType<MemberAccessExpressionSyntax>().First();
+                if (context.SemanticModel.GetSymbolInfo(entityMember).Symbol is not IPropertySymbol property) continue;
+                yield return property;
+            }
+        }
+    }
+
     private static void CompareExporterAndEntity(SyntaxNodeAnalysisContext context, INamedTypeSymbol exporter, ITypeSymbol entity)
     {
         var constructors = exporter.GetConstructorsWithAParameterOfType(entity).ToList();
@@ -237,6 +305,42 @@ public class ExporterAnalyzer : DiagnosticAnalyzer
                     AnalyzerDescriptors.ExporterMustHaveConstructorTakingEntity,
                     exporter.Locations.First(l => l.IsInSource),
                     exporter.Name, entity.Name));
+            return;
+        }
+        var entityProperties = entity.GetReadOnlyTypeProperties().ToList();
+        
+        foreach (var ctor in constructors)
+        {
+            var assignments = GetEntityAssignmentsInMethod(context, ctor, entity).ToList();
+            var ignored = FindIgnoredFieldsInMethod(context, ctor, entity).ToList();
+            foreach (var a in assignments)
+            {
+                Console.WriteLine($"{a.Left.ToDisplayString()} <- {a.Right.ToDisplayString()}");
+            }
+
+            foreach (var i in ignored)
+            {
+                Console.WriteLine($"Ignored: {i.ToDisplayString()}");
+            }
+
+            var foundProperties = assignments.Select(a => a.Right).Concat(ignored);
+
+            var missingAssignments = entityProperties.Where(ep => !foundProperties.Any(p => SymbolEqualityComparer.Default.Equals(ep, p)));
+
+            foreach (var a in missingAssignments)
+            {
+                // Figure out where the ctor is so we can point the warning at it.
+                var ctorLocation = ctor.Locations.First();
+
+                // Emit the warning
+                context.ReportDiagnostic(
+                    Diagnostic.Create(
+                        AnalyzerDescriptors.ExporterMustHaveAllEntityProperties,
+                        ctorLocation,
+                        entity.Name, a.Name
+                    )
+                );
+            }
         }
     }
 }
